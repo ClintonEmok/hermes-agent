@@ -744,6 +744,34 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+# Bot Mode's per-profile forever-chat is identified by this exact title (the
+# hermes-bots desktop plugin resolves canonical identity by
+# ``(profile_name, title='Bot Chat')``, not by stored ids).
+CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
+
+# End reasons that describe an *accidental* transport loss rather than an
+# intentional conversation boundary. ``ws_orphan_reap`` is already treated as
+# recoverable for gateway-peer rows (#60609 family); the same leniency applies
+# to Bot Chats below.
+_ACCIDENTAL_END_REASONS = frozenset({"ws_orphan_reap"})
+
+
+def _is_canonical_bot_chat_row(row: dict | None) -> bool:
+    """True when the state.db row is the per-profile canonical Bot Chat.
+
+    The row's ``profile_name`` scopes the identity; the title match is exact.
+    """
+    if not row:
+        return False
+
+    title = str(row.get("title") or "").strip()
+
+    return bool(
+        str(row.get("profile_name") or "").strip()
+        and title == CANONICAL_BOT_CHAT_TITLE
+    )
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -840,12 +868,33 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                     # Ending a gateway session in state.db triggers a Groundhog
                     # Day routing loop: the gateway's #54878 self-heal detects
                     # the stale entry, recovers to the parent session, context
-                    # compression splits back to the reaped child, and the cycle
-                    # repeats on every inbound message.  (#60609)
+                    # compression splits back to the reaped child, and the
+                    # cycle repeats on every inbound message.  (#60609)
                     row = db.get_session(session_id)
                     source = (row or {}).get("source", "")
                     _tui_owns_lifecycle = not _is_gateway_owned_source(source)
-                    if _tui_owns_lifecycle:
+                    if (
+                        _tui_owns_lifecycle
+                        and end_reason in _ACCIDENTAL_END_REASONS
+                        and _is_canonical_bot_chat_row(row)
+                    ):
+                        # Don't END Bot Mode's canonical forever-chat on an
+                        # accidental reap either (#92687): its durable identity
+                        # is (profile_name, title='Bot Chat') — an ended row
+                        # archives it out from under every future open, the
+                        # plugin's recreate then collides with the title UNIQUE
+                        # index and forks throwaway sessions instead. Leave the
+                        # row open so reconnect resume finds it; the in-process
+                        # teardown below proceeds unchanged. An explicit user
+                        # boundary (tui_close, session.close, /new) still ends
+                        # it normally.
+                        logger.info(
+                            "skipping %s end-write for canonical Bot Chat row "
+                            "%s; leaving it open for reconnect resume",
+                            end_reason,
+                            session_id,
+                        )
+                    elif _tui_owns_lifecycle:
                         db.end_session(session_id, end_reason)
         except Exception:
             pass
