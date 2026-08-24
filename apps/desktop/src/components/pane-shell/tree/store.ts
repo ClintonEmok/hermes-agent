@@ -57,7 +57,7 @@ const STORAGE_KEY = 'hermes.desktop.layoutTree.v2'
  * sessions left stale groups behind and the user's hand-built arrangement was
  * lost (#92818). The LIVE tree keeps them; only the stored copy drops them.
  */
-const EPHEMERAL_PANE_PREFIXES = ['preview-tile:', 'route-tile:'] as const
+const EPHEMERAL_PANE_PREFIXES = ['preview-tile:', 'route-tile:', 'session-tile:'] as const
 
 const isEphemeralPaneId = (paneId: string): boolean =>
   EPHEMERAL_PANE_PREFIXES.some(prefix => paneId.startsWith(prefix))

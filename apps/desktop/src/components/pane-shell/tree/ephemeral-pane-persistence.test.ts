@@ -36,6 +36,7 @@ describe('ephemeral panes are stripped from the persisted layout tree', () => {
 
   async function setup() {
     const store = await import('@/components/pane-shell/tree/store')
+
     return store
   }
 
@@ -98,6 +99,7 @@ describe('ephemeral panes are stripped from the persisted layout tree', () => {
   it('stripEphemeralPanes leaves a tree without ephemeral panes unchanged (same reference)', () => {
     void import('@/components/pane-shell/tree/store').then(async () => {
       const { stripEphemeralPanes } = await import('@/components/pane-shell/tree/store')
+
       const plain = {
         type: 'group',
         id: 'g',
@@ -107,5 +109,85 @@ describe('ephemeral panes are stripped from the persisted layout tree', () => {
 
       expect(stripEphemeralPanes(plain as never)).toBe(plain)
     })
+  })
+})
+
+// #94260: user-saved layout presets are a SECOND persistence path for the
+// tree. Baking in live tile ids (session-tile:/preview-tile:/route-tile:) made
+// applying a preset remount dead conversations — session.resume against
+// vanished runtimes, ws_orphan_reap, RPCs to nothing. The strip must cover
+// both paths: saveLayoutPresetTree (save time) and applyLayoutPreset
+// (apply time, so presets saved by older builds heal too).
+describe('layout presets never carry ephemeral panes (#94260)', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    vi.resetModules()
+  })
+
+  afterEach(() => {
+    window.localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  it('saveLayoutPresetTree strips session/preview/route tiles at save time', async () => {
+    const { saveLayoutPresetTree } = await import('./presets')
+
+    const live = {
+      type: 'split',
+      id: 'root',
+      orientation: 'row',
+      weights: [1, 1],
+      children: [
+        { type: 'group', id: 'g-a', panes: ['workspace', 'session-tile:20260825_000852_e08305'], active: 'session-tile:20260825_000852_e08305' },
+        { type: 'group', id: 'g-b', panes: ['preview-tile:url:x', 'route-tile:/y'] }
+      ]
+    } as never
+
+    expect(saveLayoutPresetTree('Work', live)).toBeTruthy()
+
+    const stored = JSON.parse(window.localStorage.getItem('hermes.desktop.layoutPresets.v2') ?? '{}')
+    const serialized = JSON.stringify(stored)
+
+    expect(serialized).not.toContain('session-tile:')
+    expect(serialized).not.toContain('preview-tile:')
+    expect(serialized).not.toContain('route-tile:')
+    // The durable pane survives.
+    expect(serialized).toContain('workspace')
+  })
+
+  it('applyLayoutPreset heals legacy presets that baked in tiles', async () => {
+    // Simulate a preset saved by an older build: baked-in tile ids in storage.
+    window.localStorage.setItem(
+      'hermes.desktop.layoutPresets.v2',
+      JSON.stringify({
+        legacy: {
+          name: 'Legacy',
+          tree: {
+            type: 'group',
+            id: 'g',
+            panes: ['workspace', 'session-tile:dead-id', 'preview-tile:undefined'],
+            active: 'session-tile:dead-id'
+          }
+        }
+      })
+    )
+
+    const applyTree = vi.fn()
+    vi.doMock('./store', async importOriginal => {
+      const actual = await importOriginal<Record<string, unknown>>()
+
+      return { ...actual, applyTree }
+    })
+
+    const { applyLayoutPreset } = await import('./presets')
+    const stored = JSON.parse(window.localStorage.getItem('hermes.desktop.layoutPresets.v2') ?? '{}')
+    applyLayoutPreset('legacy', stored.legacy.tree)
+
+    expect(applyTree).toHaveBeenCalledTimes(1)
+    const applied = applyTree.mock.calls[0][0] as { children?: Array<{ panes: string[] }> }
+    const serialized = JSON.stringify(applied)
+    expect(serialized).not.toContain('session-tile:')
+    expect(serialized).not.toContain('preview-tile:')
+    expect(JSON.stringify(applied)).toContain('workspace')
   })
 })
