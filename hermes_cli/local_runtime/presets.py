@@ -1,7 +1,6 @@
 """Per-model preset generation (--models-preset INI) — the router-side carrier for context-policy
 launch decisions.
 """
-
 from __future__ import annotations
 
 import logging
@@ -99,6 +98,42 @@ def _restore_grown_window(model_id: str, profile: ModelProfile, budget: Hardware
     return decision
 
 
+def _recheck_posture_after_growth(
+        profile: ModelProfile, budget: HardwareBudget, fixed_overhead: int,
+        initial_mtp_prefill: bool, initial_logits_bytes: int,
+        grown_decision: WindowDecision) -> tuple[bool, int]:
+    """Re-check MTP posture after a grown window may have pushed the initial posture into spill.
+
+    When the initial window was priced for stacked (big-ubatch) MTP prefill, the grown window can
+    exceed VRAM — causing silent CPU offload of FFN tensors.  This re-evaluates: if the stacked
+    posture would spill at the grown window, re-price both postures at the larger window to find the
+    one that avoids spill (lean = smaller ubatch, ~2 GiB less overhead).  Returns the adjusted
+    (mtp_prefill, logits_bytes) pair.
+    """
+    if not initial_mtp_prefill:
+        # Already lean — nothing to re-check.
+        return initial_mtp_prefill, initial_logits_bytes
+
+    # The initial posture was stacked (big-ubatch).  Check if it still fits at the grown window.
+    kv = ctx_bytes(profile, grown_decision.window)
+    stacked_logits = ub_logits_bytes(profile.n_vocab, mtp_capable=True, mtp_prefill=True)
+    stacked_need = profile.weights_bytes + kv + fixed_overhead + stacked_logits
+    if stacked_need <= budget.usable_vram_bytes:
+        return True, stacked_logits  # still fits — keep stacked
+
+    # Stacked would spill at the grown window.  Try lean posture.
+    plain_logits = ub_logits_bytes(profile.n_vocab, mtp_capable=True, mtp_prefill=False)
+    plain_need = profile.weights_bytes + kv + fixed_overhead + plain_logits
+    if plain_need <= budget.usable_vram_bytes:
+        logger.info("posture degraded to lean at grown %dK window to avoid CPU offload",
+                     grown_decision.window // 1024)
+        return False, plain_logits
+
+    # Both spill — stay with the original (lean) to minimize spill.
+    logger.info("both MTP postures spill at grown %dK window; using lean", grown_decision.window // 1024)
+    return False, plain_logits
+
+
 def _preset_for(gguf: Path, budget: HardwareBudget,
                 mtp_capable: set[str]) -> PresetEntry | None:
     """The launch decision for one staged model, or None when its header is unreadable."""
@@ -131,7 +166,32 @@ def _preset_for(gguf: Path, budget: HardwareBudget,
     decision = initial_window(profile, budget, overhead_bytes=overhead)
     if isinstance(decision, PhysicsRefusal):
         return PresetEntry(model_id=model_id, window=0, spilled=False, refusal=decision.message)
-    decision = _restore_grown_window(model_id, profile, budget, decision, overhead)
+
+    # ── MTP posture re-check after grown window ────────────────────────────────────
+    # The initial posture was priced at the launch window.  _restore_grown_window may lift
+    # the window beyond VRAM, silently pushing stacked (big-ubatch) MTP prefill into CPU
+    # offload.  Re-check: if stacked would spill at the grown window, degrade to lean
+    # (smaller ubatch, ~2 GiB less) to avoid the speed cliff.
+    grown_decision = _restore_grown_window(model_id, profile, budget, decision, overhead)
+    if is_mtp:
+        mtp_prefill, logits_bytes = _recheck_posture_after_growth(
+            profile, budget, fixed_overhead,
+            mtp_prefill, logits_bytes, grown_decision)
+        overhead = fixed_overhead + logits_bytes
+
+    # The grown window may need re-pricing with the adjusted overhead (lean posture uses
+    # less overhead, so the window might fit better).
+    decision = grown_decision
+    if grown_decision.spilled and mtp_prefill:
+        # The initial posture was stacked and the grown window spilled — re-check if lean
+        # overhead allows the same window without spill (the grown window was physics-cleared
+        # for the OLD overhead, but lean is ~2 GiB lighter).
+        kv = ctx_bytes(profile, decision.window)
+        lean_need = profile.weights_bytes + kv + overhead
+        if lean_need <= budget.usable_vram_bytes:
+            decision = WindowDecision(
+                window=decision.window, spill_bytes=0, kv_on_gpu=True,
+                reasons=[f"grown window {decision.window // 1024}K fits with lean posture"])
 
     # The launch flags MUST match the pricing above (same entry/is_mtp/posture).
     keys = _args_to_keys(launch_args(

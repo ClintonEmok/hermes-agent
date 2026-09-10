@@ -5,7 +5,6 @@ Every payload carries plain-language, pre-formatted facts the UI shows verbatim
 runtime doing), never raw internals. Long jobs follow the repo's job pattern:
 start-POST -> {job_id} -> GET poll with byte progress.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +27,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from starlette.concurrency import run_in_threadpool
-
 from hermes_cli import config as config_mod, web_deps
 from hermes_cli.local_runtime import (
     binaries, bootstrap, catalog, context_policy, estimator, growth, hardware, hf_browse,
@@ -114,6 +112,23 @@ def _quiet(fn: Callable[[], Any], default: Any, *, warn: str | None = None, debu
         if debug:
             logger.debug(debug, exc_info=True)
         return default
+
+
+# ── spill warning helpers ─────────────────────────────────────────────
+def _spill_warning_text(plan: presets.PresetEntry | None, granted_window: int | None) -> str | None:
+    """Human-readable spill warning when tensors are offloaded to CPU.
+
+    Returns a plain-language string the UI shows when a model's FFN/expert weights
+    have been spilled to host RAM, or None when fully on GPU.
+    """
+    if plan is None or not plan.spilled:
+        return None
+    ctx_label = _k_label(granted_window) if granted_window else _k_label(plan.window)
+    return (
+        f"Some model weights are running on CPU ({ctx_label} context). "
+        f"This reduces speed. Restart the server with a smaller context window "
+        f"to run fully on GPU."
+    )
 
 
 # ── jobs ─────────────────────────────────────────────────────
@@ -421,6 +436,10 @@ def _loaded_models(running: Dict[str, Any]) -> "tuple[Dict[str, str], Dict[str, 
             .get("default_generation_settings", {}).get("n_ctx"), None)
         if n_ctx:
             facts.update(granted_window=int(n_ctx), granted_window_label=_k_label(int(n_ctx)))
+        # Surface spill as a user-facing warning so the user knows why the model is slow.
+        spill_msg = _spill_warning_text(plan, int(n_ctx) if n_ctx else None)
+        if spill_msg:
+            facts["spill_warning"] = spill_msg
         if facts:
             placement[model_id] = facts
     return loaded, placement
@@ -789,7 +808,6 @@ def _stop_server() -> None:
 
 def _start_server() -> None:
     _start_local_server(_set_runtime_enabled(True), _SERVER_START_FAILED)
-
 
 _SERVER_ACTIONS = {"stop": _stop_server, "start": _start_server}
 
