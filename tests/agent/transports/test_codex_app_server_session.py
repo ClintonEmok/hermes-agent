@@ -813,11 +813,48 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
+    def test_post_tool_watchdog_reset_on_empty_projection_activity(self):
+        """A tool completion followed by a reasoning item (which projects to an
+        empty ProjectionResult) should NOT trip the watchdog.  Reasoning,
+        command output deltas, and item/started all project to nothing, but
+        they are real Codex activity — the watchdog must not false-fire.
 
-
-
-
-
+        Regression test for #107028 / #63006.
+        """
+        client = FakeClient()
+        # Tool completes — arms the watchdog.
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "npm test", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "all pass",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        # Reasoning item — projects to empty ProjectionResult but IS real activity.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "summary": ["thinking..."]},
+            threadId="t", turnId="tu1",
+        )
+        # Turn completes.
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool then reasoning", turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+            post_tool_quiet_timeout=0.05,
+        )
+        # Tool ran, then a reasoning item arrived (empty projection but real
+        # activity), then turn/completed.  Should NOT be a retirement case.
+        assert r.tool_iterations == 1
+        assert r.should_retire is False
+        assert r.interrupted is False
 
     def test_dead_subprocess_detected_between_iterations(self):
         """If codex dies (segfault, OOM, killed by its auth refresh

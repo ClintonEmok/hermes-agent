@@ -400,7 +400,16 @@ class CodexAppServerSession:
             projection, aborted = self._absorb_notification(result, projector, note)
             if projection.is_tool_iteration:
                 last_tool_completion_at = time.monotonic()
-            elif projection.messages or projection.final_text is not None:
+            else:
+                # Any real non-tool notification means codex is alive — clear the
+                # watchdog timer unconditionally.  Several Codex notification types
+                # (reasoning items, item/started, commandExecution *outputDelta)
+                # project to an empty ProjectionResult, so checking only
+                # ``projection.messages`` or ``projection.final_text`` leaves the
+                # timer armed across genuine activity and causes a false-positive
+                # 90 s watchdog trip after a tool completes.  ``take_notification``
+                # already returns None for an empty queue, so reaching this branch
+                # proves a real notification arrived.
                 last_tool_completion_at = None
             if method != "turn/completed":
                 return aborted
